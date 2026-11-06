@@ -1,0 +1,141 @@
+name: 03 - EC2 recovery and email
+'on':
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: Mumbai EC2 ID to recover
+        required: true
+        type: string
+      detected_at:
+        description: UTC detection time (optional for manual test)
+        required: false
+        type: string
+        default: Manual run
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: recovery-${{ inputs.instance_id }}
+  cancel-in-progress: false
+env:
+  INSTANCE_ID: ${{ inputs.instance_id }}
+  ALLOWED_INSTANCE_IDS: ${{ vars.ALLOWED_INSTANCE_IDS }}
+  TARGET_GROUP_ARN: ${{ vars.TARGET_GROUP_ARN }}
+  DETECTED_AT: ${{ inputs.detected_at }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  SMTP_HOST: ${{ vars.SMTP_HOST }}
+  SMTP_PORT: ${{ vars.SMTP_PORT }}
+  SMTP_USER: ${{ secrets.SMTP_USER }}
+  SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+  ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+jobs:
+  detect:
+    name: 1 - SHUTDOWN DETECTED | Validate and email
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      instance_name: ${{ steps.validate.outputs.instance_name }}
+    steps:
+    - &id001
+      uses: actions/checkout@v4
+    - &id002
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.RECOVERY_ROLE_ARN }}
+        aws-region: ap-south-1
+    - name: Install AWS SDK
+      run: pip install "boto3>=1.35,<2"
+    - name: Validate instance allowlist and stopped state
+      id: validate
+      run: python scripts/recovery.py validate
+    - name: Email - EC2 shutdown detected
+      continue-on-error: true
+      env:
+        INSTANCE_NAME: ${{ steps.validate.outputs.instance_name }}
+      run: python scripts/email_status.py shutdown
+  start:
+    name: 2 - STARTING | Start EC2 and email
+    needs:
+    - detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      INSTANCE_NAME: ${{ needs.detect.outputs.instance_name }}
+    steps:
+    - *id001
+    - *id002
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.RECOVERY_ROLE_ARN }}
+        aws-region: ap-south-1
+    - name: Install AWS SDK
+      run: pip install "boto3>=1.35,<2"
+    - name: Start the validated Mumbai instance
+      run: python scripts/recovery.py start
+    - name: Email - EC2 start initiated
+      continue-on-error: true
+      run: python scripts/email_status.py starting
+  verify:
+    name: 3 - STARTED SUCCESSFULLY | Verify EC2 and Apache
+    needs:
+    - detect
+    - start
+    runs-on: ubuntu-latest
+    timeout-minutes: 38
+    env:
+      INSTANCE_NAME: ${{ needs.detect.outputs.instance_name }}
+    steps:
+    - *id001
+    - *id002
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.RECOVERY_ROLE_ARN }}
+        aws-region: ap-south-1
+    - name: Install AWS SDK
+      run: pip install "boto3>=1.35,<2"
+    - name: Wait for EC2 checks and ALB health
+      run: python scripts/recovery.py verify
+    - name: Email - EC2 started successfully
+      run: python scripts/email_status.py success
+  failure:
+    name: 4 - FAILED | Email failure details
+    needs:
+    - detect
+    - start
+    - verify
+    if: ${{ always() && (needs.detect.result == 'failure' || needs.start.result == 'failure' || needs.verify.result == 'failure')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      INSTANCE_NAME: ${{ needs.detect.outputs.instance_name }}
+      DETAIL: 'Validation: ${{ needs.detect.result }}; Start: ${{ needs.start.result }}; Verification/email: ${{ needs.verify.result
+        }}. If verification succeeded but the success email failed, check the verification job logs.'
+    steps:
+    - *id001
+    - *id002
+    - name: Email - recovery failed
+      run: python scripts/email_status.py failure
+  summary:
+    name: 5 - SUMMARY | Record stage results
+    needs:
+    - detect
+    - start
+    - verify
+    - failure
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: Write pipeline summary
+      env:
+        DETECT_RESULT: ${{ needs.detect.result }}
+        START_RESULT: ${{ needs.start.result }}
+        VERIFY_RESULT: ${{ needs.verify.result }}
+        FAILURE_RESULT: ${{ needs.failure.result }}
+      run: "python - <<'PYCODE'\nimport os\nwith open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:\n    f.write('## EC2 recovery\
+        \ status\\n\\n')\n    f.write('| Stage | Result |\\n|---|---|\\n')\n    for title,key in [('Shutdown detected','DETECT_RESULT'),('Start\
+        \ EC2','START_RESULT'),('Verify recovery and success email','VERIFY_RESULT'),('Failure email','FAILURE_RESULT')]:\n\
+        \        f.write(f\"| {title} | {os.environ[key]} |\\n\")\nPYCODE"
