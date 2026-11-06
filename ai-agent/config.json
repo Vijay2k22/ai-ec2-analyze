@@ -1,0 +1,35 @@
+{
+  "region": "ap-south-1",
+  "bedrock_region": "ap-south-1",
+  "model": "arn:aws:bedrock:ap-south-1:893675906501:inference-profile/apac.amazon.nova-lite-v1:0",
+  "instances": [
+    "i-0a694dc4b4bbcf9b2",
+    "i-03807c84cd933cea6"
+  ],
+  "target_group": "arn:aws:elasticloadbalancing:ap-south-1:893675906501:targetgroup/vj-recovery-web-tg/3455ac6b6dcfd2ba",
+  "tags": {
+    "Project": "vj-recovery",
+    "AutoRecover": "true",
+    "Maintenance": "false"
+  },
+  "database": "/state/incidents.db",
+  "poll_seconds": 10,
+  "approval_seconds": 300,
+  "cooldown_seconds": 300,
+  "verification_seconds": 600,
+  "max_attempts": 2,
+  "cpu_threshold": 80,
+  "cpu_points": 3,
+  "apache_cpu_share": 30,
+  "apache_cpu_quota": 50,
+  "max_agent_steps": 8,
+  "diagnostic_commands": [
+    "echo service=$(systemctl is-active httpd || true)",
+    "echo http=$(curl --max-time 5 -s -o /dev/null -w '%{http_code}' http://localhost || true)",
+    "cg=/sys/fs/cgroup/system.slice/httpd.service/cpu.stat; a=$(awk '/usage_usec/{print $2}' \"$cg\" 2>/dev/null); read -r _ u n s i w q r t _ < /proc/stat; total1=$((u+n+s+i+w+q+r+t)); idle1=$((i+w)); sleep 2; b=$(awk '/usage_usec/{print $2}' \"$cg\" 2>/dev/null); read -r _ u n s i w q r t _ < /proc/stat; total2=$((u+n+s+i+w+q+r+t)); idle2=$((i+w))",
+    "awk -v a=\"$a\" -v b=\"$b\" -v cores=\"$(nproc)\" 'BEGIN{if(a!=\"\" && b!=\"\")printf \"apache_cpu=%.1f\\n\",(b-a)/2000000/cores*100;else print \"apache_cpu=unknown\"}'",
+    "awk -v total=\"$((total2-total1))\" -v idle=\"$((idle2-idle1))\" 'BEGIN{if(total>0)printf \"host_cpu=%.1f\\n\",100*(total-idle)/total;else print \"host_cpu=unknown\"}'",
+    "echo '=== PROCESSES ==='; ps -eo pid,comm,pcpu,pmem --sort=-pcpu | head -n 8",
+    "echo '=== APACHE LOG ==='; journalctl -u httpd -n 12 --no-pager; echo '=== SYSTEM ERRORS ==='; journalctl -p err -n 8 --no-pager; true"
+  ]
+}
