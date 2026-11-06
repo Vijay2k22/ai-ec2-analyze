@@ -103,6 +103,30 @@ def inspect_instance(instance_id: str) -> dict:
     return json.loads(json.dumps(result, default=str))
 
 @MCP.tool()
+def inspect_alb(instance_id: str) -> dict:
+    """Read ONLY the ALB attached to the configured target group; no changes."""
+    if instance_id not in CFG["instances"]:
+        raise ValueError("Instance is outside the paired scope.")
+    client = aws("elbv2")
+    group = client.describe_target_groups(TargetGroupArns=[CFG["target_group"]])["TargetGroups"][0]
+    arns = group.get("LoadBalancerArns", [])
+    if len(arns) != 1:
+        return {"error": "Configured target group is not attached to exactly one ALB."}
+    alb = client.describe_load_balancers(LoadBalancerArns=arns)["LoadBalancers"][0]
+    if alb["Type"] != "application":
+        return {"error": "Paired resource is not an Application Load Balancer."}
+    listeners = list(client.get_paginator("describe_listeners").paginate(LoadBalancerArn=arns[0]).search("Listeners[]"))
+    targets = client.describe_target_health(TargetGroupArn=CFG["target_group"])["TargetHealthDescriptions"]
+    return {"read_only": True, "checked_utc": datetime.now(timezone.utc).isoformat(),
+        "name": alb["LoadBalancerName"], "state": alb["State"], "dns": alb["DNSName"],
+        "scheme": alb["Scheme"], "type": alb["Type"], "vpc": alb["VpcId"],
+        "zones": alb["AvailabilityZones"], "security_groups": alb.get("SecurityGroups", []),
+        "listeners": [{k: x.get(k) for k in ("Port", "Protocol", "SslPolicy")} for x in listeners],
+        "target_group": {k: group.get(k) for k in ("TargetGroupName", "Protocol", "Port", "HealthCheckPath", "HealthCheckIntervalSeconds", "Matcher")},
+        "targets": [x for x in targets if x["Target"]["Id"] in CFG["instances"]],
+        "note": "ALB state active alone does not prove healthy targets. Other target groups are outside this paired scope."}
+
+@MCP.tool()
 def stop_history(instance_id: str) -> dict:
     """Read recent stop API events. Caller identity does not prove human intent."""
     item = instance(instance_id)
