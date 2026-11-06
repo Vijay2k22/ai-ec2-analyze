@@ -1,0 +1,12 @@
+**/.terraform/
+**/terraform.tfstate*
+**/*.tfplan
+**/terraform.tfvars
+**/backend.hcl
+*.pem
+.env
+__pycache__/
+*.zip
+local-state/
+.venv/
+__pycache__/
