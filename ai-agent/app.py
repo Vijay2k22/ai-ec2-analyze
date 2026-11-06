@@ -11,7 +11,7 @@ import streamlit as st
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from tools import BASE, CFG, ACTIONS, aws, db, initialize, records, decide
+from tools import BASE, CFG, aws, initialize, records, decide
 
 TITLE = "6F - AI | EC2 Recovery Assistant"
 SCOPE = "This is not under my scope. Please reach the AWS account administrator."
@@ -45,7 +45,7 @@ async def mcp_call(name, arguments):
             await session.initialize()
             return unpack(await session.call_tool(name, arguments))
 
-async def chat(instance_id, question, history=None):
+async def chat(instance_id, question, history=None, investigate=False):
     mentioned = set(re.findall(r"\bi-[0-9a-f]{8,17}\b", question, re.I))
     context = {"selected_instance": instance_id, "question": question, "history": (history or [])[-4:]}
     check = await asyncio.to_thread(converse, [{"role": "user", "content": [{"text": json.dumps(context)}]}], None, True)
@@ -61,9 +61,13 @@ async def chat(instance_id, question, history=None):
             await session.initialize()
             available = await session.list_tools()
             tools = [{"toolSpec": {"name": t.name, "description": t.description or t.name,
-                      "inputSchema": {"json": t.inputSchema}}} for t in available.tools if t.name in READ_TOOLS]
+                      "inputSchema": {"json": t.inputSchema}}} for t in available.tools if t.name in READ_TOOLS and (investigate or t.name != "propose_recovery")]
             # Fresh evidence is always supplied; historical dialogue cannot override it.
             fresh = unpack(await session.call_tool("inspect_instance", {"instance_id": instance_id}))
+            if investigate:
+                for row in records():
+                    if row["instance"] == instance_id and row["status"] != "recovered":
+                        unpack(await session.call_tool("verify_recovery", {"case_id": row["id"]}))
             context["fresh_evidence"] = fresh
             context["incidents"] = [r for r in records() if r["instance"] == instance_id][:3]
             messages = [{"role": "user", "content": [{"text": json.dumps(context, default=str)}]}]
@@ -76,11 +80,11 @@ async def chat(instance_id, question, history=None):
                     if response["stopReason"] != "end_turn":
                         return "Analysis incomplete. Review evidence before requesting recovery.", proposal
                     reply = re.sub(r"<thinking>.*?(</thinking>|$)", "", text_of(response), flags=re.S).strip()
-                    return reply or "Investigation incomplete; no change executed.", proposal
+                    return re.sub(r"</?response>", "", reply).strip() or "Investigation incomplete; no change executed.", proposal
                 results = []
                 for call in calls:
                     try:
-                        if call["name"] not in READ_TOOLS or call["input"].get("instance_id") != instance_id:
+                        if call["name"] not in READ_TOOLS or (call["name"] == "propose_recovery" and not investigate) or call["input"].get("instance_id") != instance_id:
                             raise ValueError("Tool or target is outside scope.")
                         data = unpack(await session.call_tool(call["name"], call["input"]))
                         if call["name"] == "propose_recovery":
@@ -92,57 +96,6 @@ async def chat(instance_id, question, history=None):
                                     "content": [{"text": json.dumps(data, default=str)}]}})
                 messages.append({"role": "user", "content": results})
             return "Investigation limit reached. Review the evidence; no automatic change executed.", proposal
-
-async def monitor():
-    initialize()
-    with db() as connection:
-        connection.execute("CREATE TABLE IF NOT EXISTS watch (instance TEXT PRIMARY KEY, latched INTEGER DEFAULT 0, healthy REAL)")
-        for item in CFG["instances"]:
-            connection.execute("INSERT OR IGNORE INTO watch(instance) VALUES(?)", (item,))
-    jobs, next_cpu, cached_cpu = {}, 0, {}
-    async def investigate(item):
-        try:
-            reply, proposal = await chat(item, "Investigate this detected incident. Review stop history or CPU/process evidence as appropriate. Propose a supported remedy if justified; otherwise give the cause/uncertainty and manual suggestions.")
-            if not proposal:
-                with db() as connection:
-                    if not connection.execute("SELECT id FROM cases WHERE instance=? AND status!='recovered'", (item,)).fetchone():
-                        connection.execute("INSERT INTO cases(id,instance,kind,status,action,evidence,created,deadline) VALUES(?,?,?,'review','',?,?,0)",
-                                           (str(__import__('uuid').uuid4()), item, "observation", reply, time.time()))
-            print(f"{item}: {reply}", flush=True)
-        except Exception as error:
-            print(f"{item}: investigation failed; use chat: {error}", flush=True)
-    while True:
-        try:
-            from tools import cpu
-            states = await asyncio.to_thread(aws("ec2").describe_instances, InstanceIds=CFG["instances"])
-            health = await asyncio.to_thread(aws("elbv2").describe_target_health, TargetGroupArn=CFG["target_group"])
-            targets = {x["Target"]["Id"]: x["TargetHealth"]["State"] for x in health["TargetHealthDescriptions"]}
-            sample_cpu = time.time() >= next_cpu
-            for reservation in states["Reservations"]:
-                for item in reservation["Instances"]:
-                    iid, state = item["InstanceId"], item["State"]["Name"]
-                    if sample_cpu:
-                        cached_cpu[iid] = await asyncio.to_thread(cpu, iid)
-                    high = cached_cpu.get(iid, {}).get("sustained_high", False)
-                    healthy = state == "running" and targets.get(iid) == "healthy" and not high
-                    abnormal = state == "stopped" or high or targets.get(iid) == "unhealthy"
-                    eligible = all({t["Key"]: t["Value"] for t in item.get("Tags", [])}.get(k) == v for k, v in CFG["tags"].items())
-                    with db() as connection:
-                        connection.execute("BEGIN IMMEDIATE")
-                        watch = connection.execute("SELECT * FROM watch WHERE instance=?", (iid,)).fetchone()
-                        since = (watch["healthy"] or time.time()) if healthy else None
-                        latched = 0 if since and time.time()-since >= CFG["cooldown_seconds"] else watch["latched"]
-                        unresolved = connection.execute("SELECT id FROM cases WHERE instance=? AND status!='recovered'", (iid,)).fetchone()
-                        trigger = abnormal and eligible and not latched and not unresolved
-                        connection.execute("UPDATE watch SET latched=?, healthy=? WHERE instance=?", (1 if trigger else latched, since, iid))
-                    if trigger and (iid not in jobs or jobs[iid].done()):
-                        jobs[iid] = asyncio.create_task(investigate(iid))
-                    print(f"{iid}: state={state} ALB={targets.get(iid)} sustained_high_cpu={high}", flush=True)
-            if sample_cpu:
-                next_cpu = time.time()+60
-        except Exception as error:
-            print(f"Monitoring error: {error}", flush=True)
-        await asyncio.sleep(CFG["poll_seconds"])
 
 def main():
     st.set_page_config(page_title=TITLE, layout="wide")
@@ -177,7 +130,7 @@ def main():
         if st.button("Investigate", type="primary"):
             with st.spinner("Investigating…"):
                 try:
-                    reply, proposal = asyncio.run(chat(iid, "Investigate current health and stop/CPU evidence. Propose a supported recovery if needed; never execute it."))
+                    reply, proposal = asyncio.run(chat(iid, "Investigate current health and stop/CPU evidence. Propose a supported recovery if needed; never execute it.", investigate=True))
                     st.session_state.setdefault(f"chat-{iid}", []).append({"role": "assistant", "text": reply})
                     st.session_state.case = proposal["id"] if proposal else None
                     st.session_state.view = "chat"
@@ -234,9 +187,13 @@ def main():
                 if st.button("Execute approved action"):
                     asyncio.run(mcp_call("execute_approved", {"case_id": row["id"], "version": row["version"]}))
                     st.rerun()
-            elif row["status"] in {"executing", "review"} and row["attempted"]:
+            elif row["status"] in {"executing", "review", "rejected"}:
                 if st.button("Verify recovery"):
-                    st.session_state.notice = asyncio.run(mcp_call("verify_recovery", {"case_id": row["id"]}))
+                    for case in records():
+                        if case["instance"] == iid and case["status"] != "recovered":
+                            checked = asyncio.run(mcp_call("verify_recovery", {"case_id": case["id"]}))
+                            if case["id"] == row["id"]:
+                                st.session_state.notice = checked
                     st.rerun()
             elif row["status"] == "recovered":
                 st.success("Recovery verified. Ask for a fresh status check anytime.")

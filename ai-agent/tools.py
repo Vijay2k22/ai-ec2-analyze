@@ -244,35 +244,32 @@ def execute_approved(case_id: str, version: int) -> dict:
 def verify_recovery(case_id: str) -> dict:
     """Check actual health; never re-execute recovery. Uncertainty needs manual review."""
     row = next((r for r in records() if r["id"] == case_id), None)
-    if not row or row["status"] not in {"executing", "review"}:
-        raise ValueError("No execution is awaiting verification.")
+    if not row or row["status"] == "recovered":
+        raise ValueError("No unresolved incident to verify.")
     result = json.loads(row["result"])
-    if not row["attempted"]:
-        raise ValueError("No execution recorded in this version.")
     state = inspect_instance(row["instance"])
     service = diagnose_service(row["instance"]) if state["state"] == "running" else {}
     healthy = (state["state"] == "running" and state["target"].get("State") == "healthy"
                and service.get("service") == "active" and service.get("http") == "200")
     healthy = healthy and all(c.get(k, {}).get("Status") == "ok" for c in state["checks"] for k in ("InstanceStatus", "SystemStatus")) and bool(state["checks"])
     if row["kind"] == "cpu":
+        metric = state.get("cpu", {})
+        healthy = healthy and metric.get("fresh", False) and len(metric.get("points", [])) >= CFG["cpu_points"]
+        healthy = healthy and all(p["average"] < CFG["cpu_threshold"] for p in metric.get("points", []))
         healthy = healthy and float(service.get("host_cpu", "nan")) < CFG["cpu_threshold"]
     verification = {"recovered": healthy, "state": state["state"], "alb": state["target"],
                     "service": service.get("service"), "http": service.get("http"), "host_cpu": service.get("host_cpu"),
                     "checked_utc": datetime.now(timezone.utc).isoformat(),
                     "note": "Health verified; this does not independently prove the cause of recovery."}
-    status = "recovered" if healthy else "review" if time.time()-row["attempted"] > CFG["verification_seconds"] else "executing"
+    status = "recovered" if healthy else row["status"]
+    verification["resolution"] = "Verified after recorded action" if row["attempted"] else "Resolved outside this agent"
     result["verification"] = verification
     if healthy:
         result.pop("uncertain", None)
     with db() as connection:
-        connection.execute("UPDATE cases SET status=?, result=? WHERE id=? AND version=? AND status IN ('executing','review')", (status, json.dumps(result), case_id, row["version"]))
+        connection.execute("UPDATE cases SET status=?, result=? WHERE id=? AND version=? AND status=? AND attempted=?", (status, json.dumps(result), case_id, row["version"], row["status"], row["attempted"]))
     return {"status": status, **verification}
 
 if __name__ == "__main__":
     initialize()
-    if "--monitor" in os.sys.argv:
-        import asyncio
-        from app import monitor
-        asyncio.run(monitor())
-    else:
-        MCP.run(transport="stdio")
+    MCP.run(transport="stdio")
