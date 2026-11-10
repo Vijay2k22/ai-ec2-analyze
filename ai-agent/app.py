@@ -24,9 +24,11 @@ async def chat(instance_id, question, history=None, investigate=False):
             if investigate:
                 for row in records():
                     if row['instance'] == instance_id and row['status'] != 'recovered': unpack(await session.call_tool('verify_recovery', {'case_id': row['id']}))
-            context['fresh_evidence'] = fresh; context['incidents'] = [r for r in records() if r['instance'] == instance_id][:3]; messages = [{'role': 'user', 'content': [{'text': json.dumps(context, default=str)}]}]; proposal = None
+            proposal = unpack(await session.call_tool('prepare_recovery', {'instance_id': instance_id})) if investigate else None; proposal = proposal if proposal and proposal.get('id') else None; context['approval_request'] = proposal; context['fresh_evidence'] = fresh; context['incidents'] = [r for r in records() if r['instance'] == instance_id][:3]; messages = [{'role': 'user', 'content': [{'text': json.dumps(context, default=str)}]}]
             for _ in range(CFG['max_agent_steps']):
-                response = await asyncio.to_thread(converse, messages, tools); messages.append(response['output']['message']); calls = [b['toolUse'] for b in messages[-1]['content'] if 'toolUse' in b]
+                try: response = await asyncio.to_thread(converse, messages, tools)
+                except Exception as error: return (json.dumps({'issue': 'AI analysis unavailable.', 'investigation_result': str(error), 'action': 'Review the recorded approval request.' if proposal else 'No action executed.'}), proposal)
+                messages.append(response['output']['message']); calls = [b['toolUse'] for b in messages[-1]['content'] if 'toolUse' in b]
                 if not calls:
                     if response['stopReason'] != 'end_turn': return ('Analysis incomplete. Review evidence before requesting recovery.', proposal)
                     reply = re.sub('<thinking>.*?(</thinking>|$)', '', text_of(response), flags=re.S).strip(); return (re.sub('</?response>', '', reply).strip() or 'Investigation incomplete; no change executed.', proposal)

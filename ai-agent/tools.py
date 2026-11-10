@@ -76,6 +76,18 @@ def validate_action(instance_id, action):
         share = float(evidence.get('apache_cpu', 'nan'))
         if not cpu(instance_id)['sustained_high'] or not math.isfinite(share) or share < CFG['apache_cpu_share']: raise ValueError('Sustained CPU and Apache contribution are not confirmed.')
 @MCP.tool()
+def prepare_recovery(instance_id: str) -> dict:
+    'Record a supported EC2 approval request from fresh evidence; never execute.'; state = inspect_instance(instance_id)
+    if state['state'] == 'stopped': history = stop_history(instance_id); return propose_recovery(instance_id, 'start_ec2', json.dumps({'issue': 'EC2 stopped', 'stop_history': history}))
+    if state['state'] != 'running': return {'note': 'EC2 is transitioning; check again before proposing recovery.'}
+    service = diagnose_service(instance_id)
+    if service.get('status') != 'Success': return {'note': 'Service checks unavailable; no supported recovery confirmed.'}
+    if service.get('service') in {'inactive', 'failed'} and state['target'].get('State') == 'unhealthy': return propose_recovery(instance_id, 'restart_apache', 'Fresh checks confirm Apache inactive/failed and ALB target unhealthy.')
+    if state.get('cpu', {}).get('sustained_high'):
+        try: return propose_recovery(instance_id, 'limit_apache_cpu', 'Sustained CPU pressure and Apache contribution confirmed by action validation.')
+        except ValueError as error: return {'note': str(error)}
+    return {'note': 'No supported recovery action confirmed by current evidence.'}
+@MCP.tool()
 def propose_recovery(instance_id: str, action: str, reason: str) -> dict:
     'Validate evidence and create an approval request; NEVER executes a change.'; validate_action(instance_id, action); now = time.time()
     with db() as connection:
