@@ -31,5 +31,6 @@
     "awk -v total=\"$((total2-total1))\" -v idle=\"$((idle2-idle1))\" 'BEGIN{if(total>0)printf \"host_cpu=%.1f\\n\",100*(total-idle)/total;else print \"host_cpu=unknown\"}'",
     "echo '=== PROCESSES ==='; ps -eo pid,comm,pcpu,pmem --sort=-pcpu | head -n 8",
     "echo '=== APACHE LOG ==='; journalctl -u httpd -n 12 --no-pager; echo '=== SYSTEM ERRORS ==='; journalctl -p err -n 8 --no-pager; true"
-  ]
+  ],
+  "alb_name": "vj-recovery-web-alb"
 }
